@@ -145,7 +145,7 @@ let bestCandidateFilter = null;
 
 const lastNetFilterSession = window.location.host + window.location.pathname;
 let lastNetFilterHostname = '';
-let lastNetFilterUnion = '';
+let lastNetFilterUnion = [];
 
 /******************************************************************************/
 
@@ -291,16 +291,24 @@ const mergeStrings = function(urls) {
             } else {
                 result.push(diff[1].replace(/\n+/g, ''));
             }
+            merged = result.join('');
         }
-        // Keep usage of wildcards to a sane level, too many of them can cause
-        // high overhead filters
-        merged =
-            result.join('')
-                .replace(/\*+$/, '')
-                .replace(/\*{2,}/g, '*')
-                .replace(/([^*]{1,2}\*)(?:[^*]{1,2}\*)+/g, '$1');
     }
+    // Keep usage of wildcards to a sane level, too many of them can cause
+    // high overhead filters
+    merged = merged.replace(/^\*+$/, '')
+                   .replace(/\*{2,}/g, '*')
+                   .replace(/([^*]{1,3}\*)(?:[^*]{1,3}\*)+/g, '$1');
     return merged;
+};
+
+/******************************************************************************/
+
+// Remove fragment part from a URL.
+
+const trimFragmentFromURL = function(url) {
+    const pos = url.indexOf('#');
+    return pos !== -1 ? url.slice(0, pos) : url;
 };
 
 /******************************************************************************/
@@ -313,7 +321,9 @@ const backgroundImageURLFromElement = function(elem) {
     const bgImg = style.backgroundImage || '';
     const matches = /^url\((["']?)([^"']+)\1\)$/.exec(bgImg);
     const url = matches !== null && matches.length === 3 ? matches[2] : '';
-    return url.lastIndexOf('data:', 0) === -1 ? url.slice(0, 1024) : '';
+    return url.lastIndexOf('data:', 0) === -1
+        ? trimFragmentFromURL(url.slice(0, 1024))
+        : '';
 };
 
 /******************************************************************************/
@@ -322,84 +332,73 @@ const backgroundImageURLFromElement = function(elem) {
 //   Limit returned string to 1024 characters.
 //   Also, return only URLs which will be seen by an HTTP observer.
 
-const resourceURLFromElement = function(elem) {
+const resourceURLsFromElement = function(elem) {
+    const urls = [];
     const tagName = elem.localName;
     const prop = netFilter1stSources[tagName];
-    if ( prop ) {
-        let src = '';
-        {
-            let s = elem[prop];
-            if ( typeof s === 'string' && /^https?:\/\//.test(s) ) {
-                src = s.slice(0, 1024);
-            }
-        }
-        if ( typeof elem.srcset === 'string' && elem.srcset !== '' ) {
-            const ss = [];
-            for ( let s of elem.srcset.split(',') ) {
-                s = s.trim();
-                const pos = s.indexOf(' ');
-                if ( pos !== -1 ) { s = s.slice(0, pos); }
-                const parsedURL = new URL(s, document.baseURI);
-                if ( parsedURL.pathname.length > 1 ) {
-                    ss.push(parsedURL.href);
-                }
-            }
-            if ( ss.length !== 0 ) {
-                if ( src !== '' ) {
-                    ss.push(src);
-                }
-                src = mergeStrings(ss);
-            }
-        }
-        return src;
+    if ( prop === undefined ) {
+        const url = backgroundImageURLFromElement(elem);
+        if ( url !== '' ) { urls.push(url); }
+        return urls;
     }
-    return backgroundImageURLFromElement(elem);
+    {
+        const s = elem[prop];
+        if ( typeof s === 'string' && /^https?:\/\//.test(s) ) {
+            urls.push(trimFragmentFromURL(s.slice(0, 1024)));
+        }
+    }
+    if ( typeof elem.srcset === 'string' && elem.srcset !== '' ) {
+        for ( let s of elem.srcset.split(',') ) {
+            s = s.trim();
+            const pos = s.indexOf(' ');
+            if ( pos !== -1 ) { s = s.slice(0, pos); }
+            const parsedURL = new URL(s, document.baseURI);
+            if ( parsedURL.pathname.length > 1 ) {
+                urls.push(trimFragmentFromURL(parsedURL.href));
+            }
+        }
+    }
+    return urls;
 };
 
 /******************************************************************************/
 
-const netFilterFromUnion = function(toMergeURL, out) {
-    const parsedURL = new URL(toMergeURL, document.baseURI);
-
-    toMergeURL = parsedURL.pathname + parsedURL.search;
-
+const netFilterFromUnion = function(urls, out) {
     // Reset reference filter when dealing with unrelated URLs
+    const currentHostname = self.location.hostname;
     if (
-        lastNetFilterUnion === '' ||
-        parsedURL.host === '' ||
-        parsedURL.host !== lastNetFilterHostname
+        lastNetFilterUnion.length === 0 ||
+        currentHostname === '' ||
+        currentHostname !== lastNetFilterHostname
     ) {
-        lastNetFilterHostname = parsedURL.host;
-        lastNetFilterUnion = toMergeURL;
+        lastNetFilterHostname = currentHostname;
+        lastNetFilterUnion = urls.slice();
         vAPI.messaging.send('elementPicker', {
             what: 'elementPickerEprom',
-            lastNetFilterSession: lastNetFilterSession,
-            lastNetFilterHostname: lastNetFilterHostname,
-            lastNetFilterUnion: lastNetFilterUnion,
+            lastNetFilterSession,
+            lastNetFilterHostname,
+            lastNetFilterUnion,
         });
         return;
     }
 
     // Related URLs
-    lastNetFilterHostname = parsedURL.host;
-
-    let mergedURL = mergeStrings([ toMergeURL, lastNetFilterUnion ]);
-    if ( mergedURL !== '/*' && mergedURL !== toMergeURL ) {
-        const filter = '||' + lastNetFilterHostname + mergedURL;
+    lastNetFilterHostname = currentHostname;
+    let mergedURL = mergeStrings(urls.concat(lastNetFilterUnion));
+    if ( mergedURL !== '/*' && urls.indexOf(mergedURL) === -1 ) {
+        const filter = `||${mergedURL}`;
         if ( out.indexOf(filter) === -1 ) {
             out.push(filter);
         }
-    } else {
-        mergedURL = toMergeURL;
+        lastNetFilterUnion.push(mergedURL);
     }
-    lastNetFilterUnion = mergedURL;
 
     // Remember across element picker sessions
     vAPI.messaging.send('elementPicker', {
         what: 'elementPickerEprom',
-        lastNetFilterSession: lastNetFilterSession,
-        lastNetFilterHostname: lastNetFilterHostname,
-        lastNetFilterUnion: lastNetFilterUnion,
+        lastNetFilterSession,
+        lastNetFilterHostname,
+        lastNetFilterUnion,
     });
 };
 
@@ -410,8 +409,8 @@ const netFilterFromUnion = function(toMergeURL, out) {
 const netFilterFromElement = function(elem) {
     if ( elem === null ) { return 0; }
     if ( elem.nodeType !== 1 ) { return 0; }
-    let src = resourceURLFromElement(elem);
-    if ( src === '' ) { return 0; }
+    const urls = resourceURLsFromElement(elem);
+    if ( urls.length === 0 ) { return 0; }
 
     if ( candidateElements.indexOf(elem) === -1 ) {
         candidateElements.push(elem);
@@ -420,13 +419,11 @@ const netFilterFromElement = function(elem) {
     const candidates = netFilterCandidates;
     const len = candidates.length;
 
-    // Remove fragment
-    let pos = src.indexOf('#');
-    if ( pos !== -1 ) {
-        src = src.slice(0, pos);
+    for ( let i = 0; i < urls.length; i++ ) {
+        urls[i] = urls[i].replace(/^https?:\/\//, '');
     }
+    const pattern = mergeStrings(urls);
 
-    const filter = src.replace(/^https?:\/\//, '||');
 
     if ( bestCandidateFilter === null ) {
         bestCandidateFilter = {
@@ -436,16 +433,16 @@ const netFilterFromElement = function(elem) {
         };
     }
 
-    candidates.push(filter);
+    candidates.push(`||${pattern}`);
 
     // Suggest a less narrow filter if possible
-    pos = filter.indexOf('?');
+    const pos = pattern.indexOf('?');
     if ( pos !== -1 ) {
-        candidates.push(filter.slice(0, pos));
+        candidates.push(`||${pattern.slice(0, pos)}`);
     }
 
     // Suggest a filter which is a result of combining more than one URL.
-    netFilterFromUnion(src, candidates);
+    netFilterFromUnion(urls, candidates);
 
     return candidates.length - len;
 };
@@ -1683,7 +1680,9 @@ const startPicker = function(details) {
     const eprom = details.eprom || null;
     if ( eprom !== null && eprom.lastNetFilterSession === lastNetFilterSession ) {
         lastNetFilterHostname = eprom.lastNetFilterHostname || '';
-        lastNetFilterUnion = eprom.lastNetFilterUnion || '';
+        lastNetFilterUnion = Array.isArray(eprom.lastNetFilterUnion)
+            ? eprom.lastNetFilterUnion
+            : [];
     }
 
     // Auto-select a specific target, if any, and if possible
